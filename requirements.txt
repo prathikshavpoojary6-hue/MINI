@@ -1,0 +1,8 @@
+# GATE AI Tutor - Python Dependencies
+streamlit>=1.38.0
+PyMuPDF>=1.24.0
+requests>=2.31.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
