@@ -160,13 +160,14 @@ class AppSettings:
     allow_explicit_fallback: bool = False
     fallback_model_id: str = ""
     temperature: float = 0.25
-    max_tokens: int = 1200
-    request_timeout: int = 120
+    max_tokens: int = 1024   # keep ≤ 1024 so prompt+response fits in num_ctx=2048
+    request_timeout: int = 180  # 3 min — Ministral 3B needs ~40-80 s on CPU
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     chunk_size: int = 750
     chunk_overlap: int = 120
     top_k_retrieval: int = 4
     min_similarity_score: float = 0.35
+    num_ctx: int = 2048  # Ollama context window — keep at 2048 for 16 GB RAM safety
     lora_adapter_note: str = (
         "Future LoRA/QLoRA fine-tuned Ministral 3 3B adapters can be served via an "
         "Ollama Modelfile (ADAPTER ./adapter.gguf) or OpenAI-compatible vLLM endpoint."
@@ -193,6 +194,7 @@ class AppSettings:
         env_openai_url = os.getenv("GATE_OPENAI_BASE_URL")
         env_openai_key = os.getenv("GATE_OPENAI_API_KEY")
         env_embed = os.getenv("GATE_EMBEDDING_MODEL")
+        env_num_ctx = os.getenv("GATE_NUM_CTX")
 
         if env_provider:
             defaults.llm_provider = env_provider.strip()
@@ -206,6 +208,11 @@ class AppSettings:
             defaults.openai_api_key = env_openai_key.strip()
         if env_embed:
             defaults.embedding_model = env_embed.strip()
+        if env_num_ctx:
+            try:
+                defaults.num_ctx = int(env_num_ctx)
+            except ValueError:
+                pass
 
         # Safety guard: never allow Llama as the configured default if accidentally empty
         if not defaults.model_id.strip():

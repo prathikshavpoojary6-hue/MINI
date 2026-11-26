@@ -2,10 +2,17 @@
 
 Syllabus-based AI Tutor for GATE AI/ML & CS preparation designed around Ministral 3 3B.
 Run with: streamlit run app.py
+
+Changes v2 (LLM Integration):
+- Ask AI page now uses streaming via st.write_stream() + chat_stream()
+- Memory-safe: num_ctx=2048, num_keep=-1 (Ollama manages KV cache)
+- All other pages (Learn Concepts, MCQs, Solver) use non-streaming for structured output
+- Exact model: ministral-3:3b verified via ollama list before writing this file
 """
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Dict, List
 
@@ -19,7 +26,11 @@ from config import (
     SUBJECT_TOPICS,
     AppSettings,
 )
-from features.chat_service import answer_chat_query, answer_solver_query
+from features.chat_service import (
+    answer_chat_query,
+    answer_solver_query,
+    stream_chat_query,
+)
 from features.mcq_generator import generate_mcqs
 from llm.base import ModelStatus
 from llm.factory import get_llm_client
@@ -63,6 +74,9 @@ def _init_session_state() -> None:
 
     if "active_page" not in st.session_state:
         st.session_state.active_page = "Ask AI"
+
+    if "nav_radio" not in st.session_state:
+        st.session_state.nav_radio = st.session_state.active_page
 
     if "chats" not in st.session_state:
         first_id = uuid.uuid4().hex[:8]
@@ -111,6 +125,18 @@ def _create_new_chat() -> None:
     st.session_state.nav_radio = "Ask AI"
 
 
+def _select_chat(chat_id: str) -> None:
+    """Callback to switch to an existing chat and navigate to Ask AI before rerun."""
+    st.session_state.active_chat_id = chat_id
+    st.session_state.active_page = "Ask AI"
+    st.session_state.nav_radio = "Ask AI"
+
+
+def _on_nav_change() -> None:
+    """Sync active_page when the user clicks the sidebar navigation radio."""
+    st.session_state.active_page = st.session_state.nav_radio
+
+
 def _clear_active_chat() -> None:
     cid = st.session_state.active_chat_id
     if cid in st.session_state.chats:
@@ -118,26 +144,26 @@ def _clear_active_chat() -> None:
         st.session_state.chats[cid]["title"] = "New Chat"
 
 
-def _submit_chat_prompt(prompt: str, client, model_status: ModelStatus) -> None:
+# ---------------------------------------------------------------------------
+# Ask AI: streaming submit (replaces old _submit_chat_prompt)
+# ---------------------------------------------------------------------------
+
+def _submit_chat_stream(prompt: str, client, model_status: ModelStatus) -> None:
+    """Submit a question to Ministral 3 3B and stream the response token-by-token."""
     cid = st.session_state.active_chat_id
     chat = st.session_state.chats[cid]
     clean_prompt = prompt.strip()
     if not clean_prompt:
         return
 
+    # Update chat title from first message
     if chat["title"] == "New Chat":
         chat["title"] = clean_prompt[:36] + ("..." if len(clean_prompt) > 36 else "")
 
-    prior_history = [
-        {"role": m["role"], "content": m["content"]}
-        for m in chat["messages"]
-        if m.get("role") in ("user", "assistant") and not m.get("is_error")
-    ]
+    # Store user message immediately so it shows before the stream starts
     chat["messages"].append({"role": "user", "content": clean_prompt})
 
-    settings: AppSettings = st.session_state.settings
-    kb: LocalKnowledgeBase = st.session_state.kb
-
+    # --- AI unavailable path ---
     if not model_status.ai_available:
         chat["messages"].append(
             {
@@ -157,48 +183,66 @@ def _submit_chat_prompt(prompt: str, client, model_status: ModelStatus) -> None:
         )
         return
 
-    with st.spinner(f"Thinking with {model_status.active_model}..."):
-        result = answer_chat_query(
-            client=client,
-            kb=kb,
-            query=clean_prompt,
-            subject=st.session_state.selected_subject,
-            mode=st.session_state.explanation_mode,
-            history=prior_history,
-            use_rag=st.session_state.use_rag,
-            top_k=settings.top_k_retrieval,
-            min_score=settings.min_similarity_score,
-            temperature=settings.temperature,
-            max_tokens=settings.max_tokens,
-        )
+    settings: AppSettings = st.session_state.settings
+    kb: LocalKnowledgeBase = st.session_state.kb
 
-    if result.success:
-        chat["messages"].append(
-            {
-                "role": "assistant",
-                "content": result.answer,
-                "rag_used": result.rag_used,
-                "sources": result.sources,
-                "retrieved_chunks": result.retrieved_chunks,
-                "model_used": result.model_used,
-                "is_fallback": result.is_fallback,
-                "latency_ms": result.latency_ms,
-                "is_error": False,
-            }
-        )
-    else:
-        chat["messages"].append(
-            {
-                "role": "assistant",
-                "content": f"**Unable to generate response:** {result.error}",
-                "rag_used": result.rag_used,
-                "sources": result.sources,
-                "retrieved_chunks": result.retrieved_chunks,
-                "model_used": result.model_used,
-                "is_fallback": result.is_fallback,
-                "is_error": True,
-            }
-        )
+    prior_history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in chat["messages"][:-1]  # exclude the just-added user message
+        if m.get("role") in ("user", "assistant") and not m.get("is_error")
+    ]
+
+    # Get stream generator + RAG metadata
+    token_gen, retrieved_chunks, rag_used, is_fallback = stream_chat_query(
+        client=client,
+        kb=kb,
+        query=clean_prompt,
+        subject=st.session_state.selected_subject,
+        mode=st.session_state.explanation_mode,
+        history=prior_history,
+        use_rag=st.session_state.use_rag,
+        top_k=settings.top_k_retrieval,
+        min_score=settings.min_similarity_score,
+        temperature=settings.temperature,
+        max_tokens=settings.max_tokens,
+    )
+
+    # Stream response live inside a chat message bubble
+    t_start = time.perf_counter()
+    full_response = ""
+    with st.chat_message("assistant"):
+        full_response = st.write_stream(token_gen)
+
+    latency_ms = int((time.perf_counter() - t_start) * 1000)
+
+    # Summarize sources
+    from features.chat_service import _summarize_sources
+    sources = _summarize_sources(retrieved_chunks) if retrieved_chunks else []
+
+    # Render grounding badge immediately below the streamed response
+    render_grounding_badge(
+        rag_used=rag_used,
+        sources=sources,
+        model_used=model_status.active_model,
+        is_fallback=is_fallback,
+        latency_ms=latency_ms,
+        retrieved_chunks=retrieved_chunks,
+    )
+
+    # Persist assistant message in chat history
+    chat["messages"].append(
+        {
+            "role": "assistant",
+            "content": full_response,
+            "rag_used": rag_used,
+            "sources": sources,
+            "retrieved_chunks": retrieved_chunks,
+            "model_used": model_status.active_model,
+            "is_fallback": is_fallback,
+            "latency_ms": latency_ms,
+            "is_error": False,
+        }
+    )
 
 
 def _render_sidebar(client, model_status: ModelStatus, kb: LocalKnowledgeBase) -> None:
@@ -213,21 +257,22 @@ def _render_sidebar(client, model_status: ModelStatus, kb: LocalKnowledgeBase) -
             unsafe_allow_html=True,
         )
 
-        if st.button("＋  New Chat", type="primary", use_container_width=True):
-            _create_new_chat()
-            st.rerun()
+        st.button(
+            "＋  New Chat",
+            type="primary",
+            use_container_width=True,
+            on_click=_create_new_chat,
+        )
 
         st.markdown('<div class="sidebar-section-label">Workspace</div>', unsafe_allow_html=True)
         chosen_page = st.radio(
             "Navigation",
             options=NAV_PAGES,
-            index=NAV_PAGES.index(st.session_state.active_page),
             key="nav_radio",
+            on_change=_on_nav_change,
             label_visibility="collapsed",
         )
-        if chosen_page != st.session_state.active_page:
-            st.session_state.active_page = chosen_page
-            st.rerun()
+        st.session_state.active_page = chosen_page
 
         st.markdown('<div class="sidebar-section-label">GATE Subject</div>', unsafe_allow_html=True)
         subject = st.selectbox(
@@ -255,15 +300,13 @@ def _render_sidebar(client, model_status: ModelStatus, kb: LocalKnowledgeBase) -
             c_info = st.session_state.chats[cid]
             is_current = cid == st.session_state.active_chat_id
             prefix = "▸ " if is_current else "  "
-            if st.button(
+            st.button(
                 f"{prefix}{c_info['title']}",
                 key=f"hist_{cid}",
                 use_container_width=True,
-            ):
-                st.session_state.active_chat_id = cid
-                st.session_state.active_page = "Ask AI"
-                st.session_state.nav_radio = "Ask AI"
-                st.rerun()
+                on_click=_select_chat,
+                args=(cid,),
+            )
 
         st.markdown('<div class="sidebar-section-label">Status & Settings</div>', unsafe_allow_html=True)
         kb_status = kb.get_status()
@@ -321,6 +364,11 @@ def _render_settings_form(model_status: ModelStatus) -> None:
 
     temp = st.slider("Temperature", min_value=0.0, max_value=1.0, value=float(s.temperature), step=0.05)
     top_k = st.slider("RAG Top-K Chunks", min_value=1, max_value=8, value=int(s.top_k_retrieval))
+    num_ctx = st.slider(
+        "Context Window (num_ctx)",
+        min_value=512, max_value=4096, value=int(s.num_ctx), step=256,
+        help="Keep at 2048 for 16 GB RAM. Increasing this uses more memory.",
+    )
 
     if st.button("Save & Refresh Status", use_container_width=True):
         s.llm_provider = provider
@@ -332,10 +380,15 @@ def _render_settings_form(model_status: ModelStatus) -> None:
         s.fallback_model_id = fb_model.strip()
         s.temperature = temp
         s.top_k_retrieval = top_k
+        s.num_ctx = num_ctx
         s.save()
         st.success("Settings saved.")
         st.rerun()
 
+
+# ---------------------------------------------------------------------------
+# Ask AI page — uses streaming
+# ---------------------------------------------------------------------------
 
 def _render_ask_ai_page(client, model_status: ModelStatus, kb: LocalKnowledgeBase) -> None:
     render_model_banner(model_status)
@@ -359,31 +412,43 @@ def _render_ask_ai_page(client, model_status: ModelStatus, kb: LocalKnowledgeBas
     messages: List[Dict] = chat["messages"]
 
     if not messages:
+        # Welcome screen — clicking a suggestion triggers a stream right away
         clicked = render_welcome_screen()
         if clicked:
-            _submit_chat_prompt(clicked, client, model_status)
+            with st.chat_message("user"):
+                st.markdown(clicked)
+            _submit_chat_stream(clicked, client, model_status)
             st.rerun()
     else:
+        # Render existing history
         for msg in messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
-                if msg["role"] == "assistant" and not msg.get("is_error"):
-                    render_grounding_badge(
-                        rag_used=bool(msg.get("rag_used")),
-                        sources=msg.get("sources") or [],
-                        model_used=msg.get("model_used"),
-                        is_fallback=bool(msg.get("is_fallback")),
-                        latency_ms=int(msg.get("latency_ms") or 0),
-                        retrieved_chunks=msg.get("retrieved_chunks") or [],
-                    )
+            if msg["role"] == "assistant" and not msg.get("is_error"):
+                render_grounding_badge(
+                    rag_used=bool(msg.get("rag_used")),
+                    sources=msg.get("sources") or [],
+                    model_used=msg.get("model_used"),
+                    is_fallback=bool(msg.get("is_fallback")),
+                    latency_ms=int(msg.get("latency_ms") or 0),
+                    retrieved_chunks=msg.get("retrieved_chunks") or [],
+                )
 
+    # Chat input at the bottom
     user_prompt = st.chat_input(
         f"Ask a {st.session_state.selected_subject} question for GATE..."
     )
     if user_prompt:
-        _submit_chat_prompt(user_prompt, client, model_status)
+        # Show the user bubble immediately, then stream
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+        _submit_chat_stream(user_prompt, client, model_status)
         st.rerun()
 
+
+# ---------------------------------------------------------------------------
+# Learn Concepts page (non-streaming — structured output)
+# ---------------------------------------------------------------------------
 
 def _render_learn_concepts_page(client, model_status: ModelStatus, kb: LocalKnowledgeBase) -> None:
     render_model_banner(model_status)
@@ -470,6 +535,10 @@ def _render_learn_concepts_page(client, model_status: ModelStatus, kb: LocalKnow
         else:
             st.error(res.error)
 
+
+# ---------------------------------------------------------------------------
+# MCQ Practice page
+# ---------------------------------------------------------------------------
 
 def _render_mcq_page(client, model_status: ModelStatus, kb: LocalKnowledgeBase) -> None:
     render_model_banner(model_status)
@@ -641,6 +710,10 @@ def _render_mcq_page(client, model_status: ModelStatus, kb: LocalKnowledgeBase) 
                 st.markdown(f"**Explanation:** {q.explanation}")
 
 
+# ---------------------------------------------------------------------------
+# Step-by-Step Solver page
+# ---------------------------------------------------------------------------
+
 def _render_solver_page(client, model_status: ModelStatus, kb: LocalKnowledgeBase) -> None:
     render_model_banner(model_status)
     subject = st.session_state.selected_subject
@@ -700,7 +773,7 @@ def _render_solver_page(client, model_status: ModelStatus, kb: LocalKnowledgeBas
                     use_rag=use_rag,
                     top_k=settings.top_k_retrieval,
                     min_score=settings.min_similarity_score,
-                    max_tokens=1500,
+                    max_tokens=1200,
                 )
             st.session_state.solver_result = res
 
@@ -720,6 +793,10 @@ def _render_solver_page(client, model_status: ModelStatus, kb: LocalKnowledgeBas
         else:
             st.error(res.error)
 
+
+# ---------------------------------------------------------------------------
+# Upload & Knowledge Base page
+# ---------------------------------------------------------------------------
 
 def _render_upload_kb_page(model_status: ModelStatus, kb: LocalKnowledgeBase) -> None:
     st.markdown(
@@ -803,27 +880,31 @@ def _render_upload_kb_page(model_status: ModelStatus, kb: LocalKnowledgeBase) ->
                     kb.delete_document(doc["doc_id"])
                     st.rerun()
 
-        st.markdown("#### Test Knowledge Base Retrieval")
-        test_q = st.text_input(
-            "Ask a test retrieval query against your indexed GATE documents",
-            placeholder="e.g., GATE DA probability syllabus, Eigenvalues, Python dictionary, Pigeonhole principle",
+    st.markdown("#### Test Knowledge Base Retrieval")
+    test_q = st.text_input(
+        "Ask a test retrieval query against your indexed GATE documents",
+        placeholder="e.g., GATE DA probability syllabus, Eigenvalues, Python dictionary, Pigeonhole principle",
+    )
+    if test_q.strip():
+        hits = kb.search(
+            query=test_q.strip(),
+            top_k=st.session_state.settings.top_k_retrieval,
+            min_score=0.05,
         )
-        if test_q.strip():
-            hits = kb.search(
-                query=test_q.strip(),
-                top_k=st.session_state.settings.top_k_retrieval,
-                min_score=0.05,
-            )
-            if not hits:
-                st.warning("No matching chunks found for that query.")
-            else:
-                for idx, hit in enumerate(hits, start=1):
-                    with st.expander(
-                        f"Match {idx}: {hit['source']} (Page {hit['page']}) • score {hit['score']:.3f}",
-                        expanded=(idx == 1),
-                    ):
-                        st.write(hit["text"])
+        if not hits:
+            st.warning("No matching chunks found for that query.")
+        else:
+            for idx, hit in enumerate(hits, start=1):
+                with st.expander(
+                    f"Match {idx}: {hit['source']} (Page {hit['page']}) • score {hit['score']:.3f}",
+                    expanded=(idx == 1),
+                ):
+                    st.write(hit["text"])
 
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     st.set_page_config(
@@ -837,7 +918,21 @@ def main() -> None:
 
     settings: AppSettings = st.session_state.settings
     kb: LocalKnowledgeBase = st.session_state.kb
-    client = get_llm_client(settings)
+
+    # Build client with num_ctx from settings (memory-safe default: 2048)
+    from llm.ollama_client import OllamaClient
+    if settings.llm_provider == "ollama":
+        client = OllamaClient(
+            base_url=settings.ollama_base_url,
+            model_id=settings.model_id,
+            allow_explicit_fallback=settings.allow_explicit_fallback,
+            fallback_model_id=settings.fallback_model_id,
+            timeout=settings.request_timeout,
+            num_ctx=settings.num_ctx,
+        )
+    else:
+        client = get_llm_client(settings)
+
     model_status = client.check_status()
     kb_status = kb.get_status()
 

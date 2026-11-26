@@ -1,11 +1,18 @@
-"""Chat and Step-by-Step Solver orchestration with strict RAG source attribution."""
+"""Chat and Step-by-Step Solver orchestration with strict RAG source attribution.
+
+Supports both:
+  - answer_chat_query()   → non-streaming (used by Learn Concepts, MCQ, Solver internally)
+  - stream_chat_query()   → streaming generator (used by Ask AI page for live token display)
+"""
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, Generator, List
 
 from llm.base import BaseLLMClient
+from llm.ollama_client import OllamaClient
 from prompts.gate_prompts import build_chat_system_prompt, build_solver_prompt
 from rag.vector_store import LocalKnowledgeBase
 
@@ -61,6 +68,27 @@ def _retrieve_if_enabled(
     return kb.search(query=query, top_k=top_k, min_score=min_score)
 
 
+def _build_messages(
+    system_prompt: str,
+    query: str,
+    history: List[Dict[str, str]] | None,
+) -> List[Dict[str, str]]:
+    """Assemble the messages list from system prompt + limited history + user query."""
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    if history:
+        for msg in history[-8:]:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": query})
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming version (for MCQ page, Learn Concepts, Solver)
+# ---------------------------------------------------------------------------
+
 def answer_chat_query(
     client: BaseLLMClient,
     kb: LocalKnowledgeBase | None,
@@ -70,9 +98,9 @@ def answer_chat_query(
     history: List[Dict[str, str]] | None = None,
     use_rag: bool = True,
     top_k: int = 4,
-    min_score: float = 0.22,
+    min_score: float = 0.35,
     temperature: float = 0.25,
-    max_tokens: int = 1200,
+    max_tokens: int = 1024,
 ) -> ChatTurnResult:
     """Generate a GATE-focused chat response, optionally grounded in uploaded PDFs."""
     retrieved = _retrieve_if_enabled(kb, query, use_rag, top_k, min_score)
@@ -81,15 +109,7 @@ def answer_chat_query(
         mode=mode,
         retrieved_chunks=retrieved if retrieved else None,
     )
-
-    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    if history:
-        for msg in history[-8:]:
-            role = msg.get("role")
-            content = msg.get("content", "")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": query})
+    messages = _build_messages(system_prompt, query, history)
 
     llm_resp = client.chat(
         messages=messages,
@@ -121,6 +141,66 @@ def answer_chat_query(
     )
 
 
+# ---------------------------------------------------------------------------
+# Streaming version — used by Ask AI page for live token display
+# ---------------------------------------------------------------------------
+
+def stream_chat_query(
+    client: BaseLLMClient,
+    kb: LocalKnowledgeBase | None,
+    query: str,
+    subject: str,
+    mode: str,
+    history: List[Dict[str, str]] | None = None,
+    use_rag: bool = True,
+    top_k: int = 4,
+    min_score: float = 0.35,
+    temperature: float = 0.25,
+    max_tokens: int = 1024,
+) -> tuple[Generator[str, None, None], List[Dict], bool, bool]:
+    """Streaming version of answer_chat_query.
+
+    Returns:
+        (token_generator, retrieved_chunks, rag_used, is_fallback)
+
+    The caller renders the stream with st.write_stream(), then uses the
+    returned metadata to record sources and grounding badges.
+    """
+    retrieved = _retrieve_if_enabled(kb, query, use_rag, top_k, min_score)
+    system_prompt = build_chat_system_prompt(
+        subject=subject,
+        mode=mode,
+        retrieved_chunks=retrieved if retrieved else None,
+    )
+    messages = _build_messages(system_prompt, query, history)
+
+    # Determine fallback status before streaming
+    status = client.check_status()
+    is_fallback = status.is_fallback if status.ai_available else False
+
+    if hasattr(client, "chat_stream"):
+        gen = client.chat_stream(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    else:
+        # Fallback for providers without streaming: wrap non-streaming call
+        def _wrap() -> Generator[str, None, None]:
+            resp = client.chat(messages, temperature=temperature, max_tokens=max_tokens)
+            if resp.success:
+                yield resp.content
+            else:
+                yield f"**Error:** {resp.error}"
+        gen = _wrap()
+
+    return gen, retrieved, bool(retrieved), is_fallback
+
+
+# ---------------------------------------------------------------------------
+# Step-by-Step Solver (non-streaming — structured output needed)
+# ---------------------------------------------------------------------------
+
 def answer_solver_query(
     client: BaseLLMClient,
     kb: LocalKnowledgeBase | None,
@@ -128,9 +208,9 @@ def answer_solver_query(
     subject: str,
     use_rag: bool = True,
     top_k: int = 4,
-    min_score: float = 0.22,
+    min_score: float = 0.35,
     temperature: float = 0.15,
-    max_tokens: int = 1400,
+    max_tokens: int = 1200,
 ) -> ChatTurnResult:
     """Solve a numerical or technical GATE problem step-by-step."""
     retrieved = _retrieve_if_enabled(kb, problem_text, use_rag, top_k, min_score)

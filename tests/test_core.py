@@ -238,29 +238,50 @@ class TestGateAITutor(unittest.TestCase):
         self.assertEqual(hits_offtopic, [])
 
     def test_streamlit_app_renders_without_ollama(self) -> None:
+        import os
+        from unittest.mock import patch
         from streamlit.testing.v1 import AppTest
 
         app_path = str(Path(__file__).resolve().parent.parent / "app.py")
-        at = AppTest.from_file(app_path, default_timeout=20)
-        at.run()
-        self.assertFalse(at.exception)
+        with patch.dict(os.environ, {"OLLAMA_BASE_URL": "http://127.0.0.1:59999"}):
+            at = AppTest.from_file(app_path, default_timeout=20)
+            at.run()
+            self.assertFalse(at.exception)
 
-        # Click a suggested question when Ollama is unavailable -> must not crash
-        suggested_btns = [b for b in at.button if b.key and b.key.startswith("suggested_q_")]
-        self.assertEqual(len(suggested_btns), 5)
-        suggested_btns[0].click().run()
-        self.assertFalse(at.exception)
+            # Click a suggested question when Ollama is unavailable -> must not crash
+            suggested_btns = [b for b in at.button if b.key and b.key.startswith("suggested_q_")]
+            self.assertEqual(len(suggested_btns), 5)
+            suggested_btns[0].click().run()
+            self.assertFalse(at.exception)
 
-        # Verify sidebar navigation pages can be switched cleanly without crashing
-        for page_name in [
-            "Learn Concepts",
-            "Practice MCQs",
-            "Step-by-Step Solver",
-            "Upload Study Material",
-            "Ask AI",
-        ]:
-            at.sidebar.radio("nav_radio").set_value(page_name).run()
-            self.assertFalse(at.exception, f"Page {page_name} raised an exception")
+            # Verify sidebar navigation pages can be switched cleanly without crashing
+            for page_name in [
+                "Learn Concepts",
+                "Practice MCQs",
+                "Step-by-Step Solver",
+                "Upload Study Material",
+                "Ask AI",
+            ]:
+                at.sidebar.radio("nav_radio").set_value(page_name).run()
+                self.assertFalse(at.exception, f"Page {page_name} raised an exception")
+
+            # Regression test: switching away from Ask AI and clicking a history button
+            # must not raise StreamlitWidgetAlreadyInstantiatedError for nav_radio.
+            at.sidebar.radio("nav_radio").set_value("Learn Concepts").run()
+            self.assertFalse(at.exception)
+            hist_btns = [b for b in at.sidebar.button if b.key and b.key.startswith("hist_")]
+            self.assertGreaterEqual(len(hist_btns), 1)
+            hist_btns[0].click().run()
+            self.assertFalse(at.exception)
+            self.assertEqual(at.sidebar.radio("nav_radio").value, "Ask AI")
+
+            # Clicking New Chat from another page must also switch cleanly to Ask AI
+            at.sidebar.radio("nav_radio").set_value("Learn Concepts").run()
+            new_chat_btns = [b for b in at.sidebar.button if "New Chat" in b.label]
+            self.assertEqual(len(new_chat_btns), 1)
+            new_chat_btns[0].click().run()
+            self.assertFalse(at.exception)
+            self.assertEqual(at.sidebar.radio("nav_radio").value, "Ask AI")
 
 
 if __name__ == "__main__":
